@@ -1,0 +1,262 @@
+#! /usr/bin/env swish
+
+;; based on https://www.pcre.org/current/doc/html/pcre2test.html
+
+(define forbid-utf? (make-parameter #f))
+(define perltest? (make-parameter #f))
+(define newline-default (make-parameter '(lf)))
+(define pattern-modifiers (make-parameter '()))
+(define subject-modifiers (make-parameter '()))
+(define pattern-match-timeout (make-parameter 1000))
+
+(define (handle-command x)
+  (define (TBD) (errorf #f "unimplemented: ~a" x))
+  (define (set param val)
+    (when (perltest?)
+      (unless
+       (match param
+         [,@pattern-modifiers #t]
+         [,@subject-modifiers
+          (match val
+            [("mark") #t]
+            [("-mark") #t]
+            [,_ #f])]
+         [,_ #f])
+       (errorf #f "incompatible perltest command: ~a" x)))
+    (param val)
+    #t)
+  (define (parse-modifiers x)
+    (split x #\,))
+  (match (pregexp-match (re "^#( |\\S+)\\s*(.*)") x)
+    [(,_ " " ,text) #t]
+    [(,_ "forbid_utf" "") (set forbid-utf? #t)]
+    [(,_ "load" ,filename) (TBD)]
+    [(,_ "newline_default" ,newline-list)
+     (set newline-default
+      (map string->symbol
+        (split (string-downcase newline-list) #\space)))]
+    [(,_ "pattern" ,modifiers)
+     (set pattern-modifiers (parse-modifiers modifiers))]
+    [(,_ "perltest" "") (set perltest? #t)]
+    [(,_ "pop" ,modifiers) (TBD)]
+    [(,_ "popcopy" ,modifiers) (TBD)]
+    [(,_ "save" ,filename) (TBD)]
+    [(,_ "subject" ,modifiers)
+     (set subject-modifiers (parse-modifiers modifiers))]
+    [(,_ ,command ,args)
+     (errorf #f "unrecognized command: ~a" x)]
+    [,_ #f]))
+
+(define (run-test ip op)
+  (define (next-line)
+    (match (get-line ip)
+      [#!eof #!eof]
+      [,s
+       (display-string s op)
+       (newline op)
+       (trim-whitespace s)]))
+  (define (non-empty? line)
+    (and (string? line) (> (string-length line) 0)))
+  (define (translate-escape c s start end os)
+    (define (emit x) (display x os))
+    (define (emit-code n)
+      (emit (pregexp-quote (string (integer->char n)))))
+    (define (braced i base)
+      (help-numeric i base
+        (case base
+          [(8) (re "^[{]([0-7]+)[}]")]
+          [(16) (re "^[{]((?i:[0-9a-f]+))[}]")])))
+    (define (help-numeric i base regexp)
+      (match (pregexp-match regexp s i end)
+        [(,all ,hit)
+         (cond
+          [(string->number hit base) =>
+           (lambda (n)
+             (emit-code n)
+             (+ i (string-length hit)))]
+          [(and (eq? hit "") (= base 16))
+           (emit #\0)
+           i]
+          [else #f])]
+        [,_ #f]))
+    (define (control i)
+      (cond
+       [(fx< i end)
+        ;; TODO incomplete, see https://perldoc.perl.org/perlop.html#Regexp-Quote-Like-Operators
+        (emit-code
+          (fxlogxor 64 (char->integer (char-upcase (string-ref s i)))))
+        (fx+ i 1)]
+       [else #f]))
+    (case c
+      [(#\\)
+       (let ([i (fx+ start 1)])
+         (and (fx< i end)
+              (let ([c (string-ref s i)] [next (fx+ i 1)])
+                (case c
+                  [(#\a) (emit #\bel) next]
+                  [(#\b) (emit #\backspace) next]
+                  [(#\c) (control next)]
+                  [(#\e) (emit #\esc) next]
+                  [(#\f) (emit #\page) next]
+                  [(#\n) (emit #\newline) next]
+                  [(#\r) (emit #\return) next]
+                  [(#\t) (emit #\tab) next]
+                  [(#\v) (emit #\vtab) next]
+                  [(#\o)
+                   (or (braced next 8)
+                       (errorf #f "invalid \\o escape at ~s in ~a" start s))]
+                  [(#\x)
+                   (or (braced next 16)
+                       (help-numeric next 16 (re "^((?i:[0-9a-f]{0,2}))"))
+                       (errorf #f "invalid \\x escape at ~s in ~a" start s))]
+                  [else
+                   (cond
+                    [(char<=? #\0 c #\7)
+                     (help-numeric i 8 (re "^([0-7]{1,3})"))]
+                    [else #f])]))))]
+      [else #f]))
+  (define (translate-extended s start end os)
+    (match (pregexp-match (re "^[(][?]#.*?[)]") s start end)
+      [(,hit)
+       (+ start (string-length hit))]
+      [,_ #f]))
+  (define (decode-subject line)
+    (define os (open-output-string))
+    (define end (string-length line))
+    ;; TODO check for subject literal modifier
+    (let scan ([i 0])
+      (unless (fx>= i end)
+        (let ([c (string-ref line i)])
+          (cond
+           [(translate-escape c line i end os) => scan]
+           [(char=? c #\\)
+            (let ([next (fx+ i 1)])
+              (when (fx< next end)
+                (write-char (string-ref line next) os))
+              (scan (fx+ next 1)))]
+           [else
+            (write-char c os)
+            (scan (fx+ i 1))]))))
+    (get-output-string os))
+  (define (decode-pattern last delim-idx lines)
+    (define os (open-output-string))
+    (define (convert s from to)
+      (define end (or to (string-length s)))
+      (let scan ([i from])
+        (unless (fx>= i end)
+          (let ([c (string-ref s i)])
+            (cond
+             [(translate-escape c s i end os) => scan]
+             [(translate-extended s i end os) => scan]
+             [else
+              (write-char c os)
+              (scan (fx+ i 1))])))))
+    (match lines
+      [() (convert last 1 delim-idx)]
+      [(,first . ,rest)
+       (convert first 1 #f)
+       (for-each
+        (lambda (s)
+          (write-char #\newline os)
+          (convert s 0 #f))
+        rest)
+       (convert last 0 delim-idx)])
+    (let* ([len (string-length last)]
+           [mod-start (fx+ delim-idx 1)]
+           [modifiers
+            (if (= mod-start len)
+                (pattern-modifiers)
+                (split (substring last mod-start len) #\,))])
+      ;; TODO deal with modifiers
+      (unless (null? modifiers)
+        (fprintf op ";; IGNORED modifiers ~s\n" modifiers))
+      (get-output-string os)))
+  (define delimiter?
+    (let ([delimiters (string->list "/!\"'`-=_:;%&@~")])
+      (lambda (c)
+        (memv c delimiters))))
+  (define (get-pattern first-line)
+    (define (rightmost c s)
+      (let search ([i (string-length s)])
+        (let ([i (fx- i 1)])
+          (and (fx>= i 0)
+               (if (char=? c (string-ref s i))
+                   i
+                   (search i))))))
+    (let ([D (string-ref first-line 0)])
+      (and (delimiter? D)
+           (let get ([line first-line] [rev '()])
+             (cond
+              [(eq? line "") (get (next-line) (cons line rev))]
+              [else
+               (let ([end (rightmost D line)])
+                 (cond
+                  [(and end (or (> end 0) (not (null? rev))))
+                   (decode-pattern line end (reverse rev))]
+                  [(starts-with? line "#") (get (next-line) rev)]
+                  [else (get (next-line) (cons line rev))]))])))))
+  (define (pat->re pat)
+    (match (try (pregexp pat))
+      [`(catch ,r)
+       (fprintf op ";; ~a\n" (exit-reason->english r))
+       ;; TODO just need to skip over the subject lines til next pattern
+       (re "^$")]
+      [,re re]))
+  (define (display-escaped line)
+    (let ([end (string-length line)])
+      (do ([i 0 (fx+ i 1)]) ((fx= i end))
+        (let* ([c (string-ref line i)]
+               [n (char->integer c)])
+          (cond
+           [(fx<= 32 n 126) (write-char c op)]
+           [(and (fx< n 256) (forbid-utf?))
+            (fprintf op "\\x~(~2,'0x~)" n)]
+           [else (fprintf op "\\x{~(~2,'0x~)}" n)])))))
+  (define (trim-captures ls)
+    ;; looks like maybe they omit <unset> for the tail of
+    ;; captures that are all #f
+    (let f ([ls (reverse ls)])
+      (match ls
+        [(#f . ,ls) (f ls)]
+        [,ls (reverse ls)])))
+  (define (test pat line)
+    (and (non-empty? line)
+         (or (starts-with? line "\\=")
+             (let* ([line (decode-subject line)]
+                    [pid
+                     (spawn
+                      (let ([me self])
+                        (lambda ()
+                          (send me
+                            `(,self . ,(try (pregexp-match pat line)))))))]
+                    [timeout (pattern-match-timeout)])
+               (receive (after timeout (kill pid 'timeout) (fprintf op ";; TIMEOUT (~sms)\n" timeout))
+                 [(,@pid . #f) (fprintf op "No match\n")]
+                 [(,@pid . `(catch ,r ,e))
+                  (fprintf op ";; ~a\n" (exit-reason->english r))]
+                 [(,@pid . ,ls)
+                  (do ([i 0 (+ i 1)] [ls (trim-captures ls) (cdr ls)])
+                      ((null? ls))
+                    (fprintf op "~2@s: " i)
+                    (if (not (car ls))
+                        (fprintf op "<unset>")
+                        (display-escaped (car ls)))
+                    (newline op))]
+                 [,other (match other)])
+               #t))))
+  (match (next-line)
+    [#!eof #f]
+    [,x
+     (or (eq? x "")
+         (handle-command x)
+         (let ([pat (and (non-empty? x) (get-pattern x))])
+           (when pat
+             (let ([re (pat->re pat)])
+               (let lp ()
+                 (when (test re (next-line))
+                   (lp)))))
+           #t))]))
+
+(let lp ()
+  (when (run-test (current-input-port) (current-output-port))
+    (lp)))
